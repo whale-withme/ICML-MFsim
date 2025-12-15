@@ -7,6 +7,8 @@ import os
 from torch.utils.data import Dataset
 from typing import Dict, List
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false" #关闭tokenizer内部多线程
+
 logging.basicConfig(
     # level=logging.INFO,  # 或 DEBUG/ERROR
     # format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'
@@ -76,7 +78,7 @@ class StateTransitionDataset(Dataset):
         cluster_info_path = self.cluster_info
         cluster_id = self.uid_map.get(uid)
         logger.info(f"[uid2profile] 输入uid: {uid}, 查到cluster_id: {cluster_id}")
-        if not cluster_id:
+        if cluster_id is None:
             logger.error(f"[uid2profile] uid {uid} 没有找到对应的 cluster_id")
             cluster_id = random.randint(0, 19)
         

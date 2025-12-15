@@ -29,16 +29,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TrainConfig:
     # --- 目录配置 ---
-    event_data_dir: str = "/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test"
+    event_data_dir: str = "/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test/tmp"
     mf_dir: str = "/root/ICML/data/test_mf"
     state_trajectory_dir: str = "/root/ICML/data/test_state_distribution"
     
-    # --- 全局共享文件 (所有事件共用) ---
-    profile_path: str = "data/cluster_core_user_profile.jsonl"
-    uid_mapping_path: str = "data/uid_mapping.csv"
-    cluster_info_path: str = "data/cluster_info.json"
+    # --- 全局共享文件 ---
+    profile_path: str = "/root/ICML/data/profile/cluster_core_user_profile.jsonl"
+    uid_mapping_path: str = "/root/ICML/data/profile/user_clusters_map.csv"
+    cluster_info_path: str = "/root/ICML/data/profile/cluster_details.json"
 
-    # --- 模型与训练参数 (保持不变) ---
+    # --- 模型与训练参数 ---
     encoder_type: str = "bert"
     model_name: str = "bert-base-chinese"
     text_emb_dim: int = 768
@@ -153,50 +153,6 @@ def build_full_dataset(cfg: TrainConfig):
     # 5. 合并
     full_dataset = ConcatDataset(dataset_list)
     return full_dataset
-
-def build_dataloader(cfg: TrainConfig, tokenizer) -> DataLoader:
-    """
-    构建 DataLoader
-    注意：Dataset 初始化时需要传入 num_agents (即原 batch_size)
-    """
-    
-    # 构建 file_config 字典传递给 Dataset
-    file_config = {
-        'cluser_user_profile': cfg.profile_path,
-        'uid_mapping_path': cfg.uid_mapping_path,
-        'cluster_info_path': cfg.cluster_info_path
-    }
-    
-    # dataset处理了profile vector，但是mf摘要还是text
-    encoder_config = {
-        "type": cfg.encoder_type,
-        "model_name": cfg.model_name
-    }
-
-    dataset = StateTransitionDataset(
-        trajectory_path=cfg.trajectory_path,
-        mf_path=cfg.mf_path,
-        test_data_path=cfg.test_data_path,
-        profile_path=cfg.profile_path,
-        encoder_config=encoder_config,
-        file_config=file_config,
-        batch_size=cfg.num_agents
-    )
-
-    # 使用默认 collate_fn 即可，因为 Dataset 返回的都是 Tensor 或 String
-    # mu_prev: Tensor(3) -> Stack -> (B, 3)
-    # mf_text: String -> List[String] (长度 B)
-    # profile_vecs: Tensor(N, D) -> Stack -> (B, N, D)
-    # target_dist: Tensor(3) -> Stack -> (B, 3)
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.train_batch_size,
-        shuffle=True,
-        num_workers=0 # 调试时设为0，避免多进程报错
-    )
-    
-    return loader
 
 def build_models(cfg: TrainConfig):
     # 1. 文本编码器 (用于处理环境文本 mf_text)
@@ -318,7 +274,7 @@ def save_checkpoint(cfg, text_encoder, state_net, epoch, loss):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
     args = parser.parse_args()
 
     # 初始化配置
@@ -334,8 +290,7 @@ def main():
     state_net.to(cfg.device)
     
     # 2. 构建 DataLoader
-    # 此时传入 text_encoder 的 tokenizer 用于 dataset 内部处理画像
-    # (如果 Dataset 内部需要处理画像文本的话)
+    # 确保传入正确的函数调用
     train_loader = build_dataloader(cfg, getattr(text_encoder, 'tokenizer', None))
 
     # 3. 优化器
