@@ -21,7 +21,7 @@ class StateTransitionNet(nn.Module):
         self,
         agent_feat_dim: int,
         text_emb_dim: int,
-        hidden_dim: int = 128,
+        hidden_dim: int = 512,
         use_layernorm: bool = False,
     ):
         super().__init__()
@@ -32,22 +32,20 @@ class StateTransitionNet(nn.Module):
         # 输入维度 = Agent特征 + 上一时刻分布(3) + 环境文本嵌入
         input_dim = agent_feat_dim + 3 + text_emb_dim
 
+        # 保持2层的MLP + GELU，如果训练困难考虑加入Residual
         layers = [
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(input_dim, 512), 
+            nn.LayerNorm(512),         
+            nn.GELU(),                 
+            nn.Dropout(0.1),           
+            
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(256, 3)
         ]
-        if use_layernorm:
-            layers.append(nn.LayerNorm(hidden_dim))
-        
-        layers.extend([
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        ])
-        
-        if use_layernorm:
-            layers.append(nn.LayerNorm(hidden_dim))
-
-        layers.append(nn.Linear(hidden_dim, 3))  # 输出 logits: [pos, neu, neg]
 
         self.mlp = nn.Sequential(*layers)
 
