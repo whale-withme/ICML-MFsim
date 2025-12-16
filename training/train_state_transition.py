@@ -7,6 +7,7 @@ import argparse
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
+from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torch.nn.functional as F
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TrainConfig:
     # --- 目录配置 ---
-    event_data_dir: str = "/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test/tmp"
+    event_data_dir: str = "/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test"
     mf_dir: str = "/root/ICML/data/test_mf"
     state_trajectory_dir: str = "/root/ICML/data/test_state_distribution"
     
@@ -47,6 +48,7 @@ class TrainConfig:
     use_layernorm: bool = True
     
     train_batch_size: int = 32
+    max_event: int = 2
     num_agents: int = 16 
     num_epochs: int = 20
     lr: float = 2e-5
@@ -76,64 +78,73 @@ def build_dataloader(cfg: TrainConfig, tokenizer) -> DataLoader:
 
 def build_full_dataset(cfg: TrainConfig):
     """
-    1. 扫描 event_data_dir 下所有的 .json 文件 (视作 test_data)
-    2. 提取 ID (例如 4264473811)
-    3. 检查对应的 _trajectory.csv 和 _mf.csv 是否存在
-    4. 如果齐全，创建该 ID 的 Dataset
-    5. 最后用 ConcatDataset 把所有 ID 的 Dataset 合并
+    逻辑变更：
+    1. 扫描 state_trajectory_dir 下所有的 *_trajectory.csv 文件 (作为锚点)
+    2. 提取 ID
+    3. 反向查找对应的 .json (raw data) 和 _mf.csv (environment context)
+    4. 如果齐全，创建 Dataset
+    5. 合并
     """
     
-    # 1. 找到所有 json 文件作为锚点
-    json_pattern = os.path.join(cfg.event_data_dir, "*.json")
-    json_files = glob.glob(json_pattern)
+    # 1. 以 Trajectory (状态分布 GT) 文件为锚点进行扫描
+    # 注意：这里扫描的是 state_trajectory_dir
+    traj_pattern = os.path.join(cfg.state_trajectory_dir, "*_trajectory.csv")
+    traj_files = glob.glob(traj_pattern)
     
-    if not json_files:
-        raise ValueError(f"未在 {cfg.event_data_dir} 下找到任何 .json 文件")
+    if not traj_files:
+        raise ValueError(f"未在 {cfg.state_trajectory_dir} 下找到任何 *_trajectory.csv 文件")
+    
+    traj_files = sorted(traj_files)
+    if cfg.max_event is not None and cfg.max_event > 0:
+        original_len = len(traj_files)
+        traj_files = traj_files[:cfg.max_event]
+        print(f"选取{cfg.max_event}测试文件……")
 
     dataset_list = []
     
-    # 准备传给 dataset 的全局配置 (profile, uid_map 等)
+    # 准备配置
     file_config = {
         'cluser_user_profile': cfg.profile_path,
         'uid_mapping_path': cfg.uid_mapping_path,
         'cluster_info_path': cfg.cluster_info_path
     }
     
-    # Encoder config (假设 dataset 内部需要)
     encoder_config = {
         "type": cfg.encoder_type,
         "model_name": cfg.model_name
     }
 
-    print(f"🔍 开始扫描数据目录: {cfg.event_data_dir} ...")
+    print(f"🔍 开始扫描 Trajectory 目录: {cfg.state_trajectory_dir} ...")
+    print(f"   (共发现 {len(traj_files)} 个分布文件)")
 
-    for json_path in json_files:
-        # json_path = "data/4264473811.json"
-        filename = os.path.basename(json_path)  # "4264473811.json"
+    for traj_path in traj_files:
+        # traj_path = ".../4264473811_trajectory.csv"
+        filename = os.path.basename(traj_path)  # "4264473811_trajectory.csv"
         
-        # 提取 ID (去除后缀)
-        event_id = os.path.splitext(filename)[0] # "4264473811"
+        # 2. 提取 ID (去除后缀 _trajectory.csv)
+        event_id = filename.replace("_trajectory.csv", "") # "4264473811"
         
-        # 排除非数据文件 (比如 cluster_info.json 如果也在同个目录)
+        # 排除非数据文件
         if "cluster" in event_id or "profile" in event_id:
             continue
 
-        # 2. 自动构建其他两个文件的路径
-        traj_path = os.path.join(cfg.state_trajectory_dir, f"{event_id}_trajectory.csv")
+        # 根据 ID 去找 json
+        json_path = os.path.join(cfg.event_data_dir, f"{event_id}.json")
+        # 根据 ID 去找 mf.csv
         mf_path = os.path.join(cfg.mf_dir, f"{event_id}_mf.csv")
         
-        # 3. 检查文件是否存在
-        if not os.path.exists(traj_path):
-            print(f"⚠️ 跳过 {event_id}: 缺少 {traj_path}")
+        # 4. 检查原材料是否存在
+        if not os.path.exists(json_path):
+            print(f"⚠️ 跳过 {event_id}: 有 Trajectory 但缺少原始 JSON 数据 -> {json_path}")
             continue
         if not os.path.exists(mf_path):
-            print(f"⚠️ 跳过 {event_id}: 缺少 {mf_path}")
+            print(f"⚠️ 跳过 {event_id}: 有 Trajectory 但缺少 MF 环境数据 -> {mf_path}")
             continue
             
-        # 4. 实例化单个 Dataset
+        # 5. 实例化单个 Dataset
         try:
             ds = StateTransitionDataset(
-                trajectory_path=traj_path,
+                trajectory_path=traj_path,  # 锚点文件
                 mf_path=mf_path,
                 test_data_path=json_path,
                 profile_path=cfg.profile_path,
@@ -150,9 +161,10 @@ def build_full_dataset(cfg: TrainConfig):
 
     print(f"✅ 成功加载 {len(dataset_list)} 个事件的数据集")
     
-    # 5. 合并
+    # 6. 合并
     full_dataset = ConcatDataset(dataset_list)
     return full_dataset
+
 
 def build_models(cfg: TrainConfig):
     # 1. 文本编码器 (用于处理环境文本 mf_text)
@@ -181,6 +193,7 @@ def train_one_epoch(
     state_net: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     train_loader: DataLoader,
+    writer: SummaryWriter
 ):
     text_encoder.train()
     state_net.train()
@@ -246,6 +259,10 @@ def train_one_epoch(
 
         optimizer.step()
 
+        # 增加loss记录
+        global_step = (epoch - 1) * len(train_loader) + batch_idx
+        writer.add_scalar('Loss/train', loss.item(), global_step)
+
         total_loss += loss.item()
         total_steps += 1
 
@@ -281,6 +298,7 @@ def main():
     cfg = TrainConfig()
     cfg.num_epochs = args.epochs
     cfg.train_batch_size = args.batch_size
+    writer = SummaryWriter(log_dir=os.path.join(cfg.save_dir, 'runs'))
     
     logger.info(f"Device: {cfg.device}")
     
@@ -303,11 +321,13 @@ def main():
     # 4. 训练循环
     best_loss = float('inf')
     for epoch in range(1, cfg.num_epochs + 1):
-        loss = train_one_epoch(epoch, cfg, text_encoder, state_net, optimizer, train_loader)
+        loss = train_one_epoch(epoch, cfg, text_encoder, state_net, optimizer, train_loader, writer)
         
         if loss < best_loss:
             best_loss = loss
             save_checkpoint(cfg, text_encoder, state_net, epoch, loss)
+
+    writer.close()
 
 if __name__ == "__main__":
     main()

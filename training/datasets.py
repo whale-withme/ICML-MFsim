@@ -158,7 +158,7 @@ class StateTransitionDataset(Dataset):
             uid = str(user_item.get('uid', ''))
 
             text_profile = self._uid2profile(uid)
-            print(uid)
+            print(f"process uid: {uid}")
             if text_profile is not None:
                 vector_profile = self._text2vector(
                     text_profile['stance_nuance']
