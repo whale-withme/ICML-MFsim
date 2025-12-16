@@ -295,29 +295,42 @@ def train_one_epoch(
     avg_loss = total_loss / max(1, total_steps)
     logger.info(f"[Epoch {epoch}] Finished. Avg Loss: {avg_loss:.6f}")
     return avg_loss
-def save_checkpoint(cfg, text_encoder, state_net, epoch, loss):
+
+
+def save_checkpoint(cfg, text_encoder, state_net, optimizer, epoch, loss, is_best=False):
     os.makedirs(cfg.save_dir, exist_ok=True)
-    save_path = os.path.join(cfg.save_dir, cfg.save_name)
-    torch.save({
+
+    ckpt = {
         'epoch': epoch,
         'model_state_dict': state_net.state_dict(),
         'encoder_state_dict': text_encoder.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(), # [关键] 保存优化器状态
         'loss': loss,
         'config': str(cfg)
-    }, save_path)
-    logger.info(f"Checkpoint saved: {save_path}")
+    }
+
+    last_path = os.path.join(cfg.save_dir, "checkpoint_last.pt")
+    torch.save(ckpt, last_path)
+
+    if is_best:
+        best_path = os.path.join(cfg.save_dir, cfg.save_name)
+        torch.save(ckpt, best_path)
+        logger.info(f"🌟 Best model saved: {best_path} (Loss: {loss:.6f})")
+    
+    logger.info(f"💾 Checkpoint saved: {last_path}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32, help="Training batch size")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     args = parser.parse_args()
 
     # 初始化配置
     cfg = TrainConfig()
     cfg.num_epochs = args.epochs
     cfg.train_batch_size = args.batch_size
-    
+
     log_dir = f"checkpoints/runs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir)
     
@@ -340,13 +353,43 @@ def main():
     )
 
     # 4. 训练循环
+    start_epoch = 1
     best_loss = float('inf')
-    for epoch in range(1, cfg.num_epochs + 1):
+    
+    if args.resume:
+        ckpt_path = os.path.join(cfg.save_dir, "checkpoint_last.pt")
+        if os.path.exists(ckpt_path):
+            print(f"🔄 正在从 {ckpt_path} 恢复训练...")
+            checkpoint = torch.load(ckpt_path, map_location=cfg.device)
+            
+            # 恢复模型权重
+            state_net.load_state_dict(checkpoint['model_state_dict'])
+            text_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            
+            # 恢复优化器 (这就保证了学习率和动量是接着上次的)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # 恢复 Epoch (从下一轮开始)
+            start_epoch = checkpoint['epoch'] + 1
+            best_loss = checkpoint.get('loss', float('inf')) # 尝试获取上次的 loss
+            
+            print(f"✅ 恢复成功！将从 Epoch {start_epoch} 开始继续训练。")
+        else:
+            print(f"⚠️ 未找到 {ckpt_path}，将从头开始训练。")
+
+    # 4. 训练循环
+    #range 从 start_epoch 开始
+    for epoch in range(start_epoch, cfg.num_epochs + 1):
+        # 记得把 writer 传进去
         loss = train_one_epoch(epoch, cfg, text_encoder, state_net, optimizer, train_loader, writer)
         
-        if loss < best_loss:
+        # 判断是否是最佳
+        is_best = loss < best_loss
+        if is_best:
             best_loss = loss
-            save_checkpoint(cfg, text_encoder, state_net, epoch, loss)
+            
+        # 保存 (注意参数变了，传入了 optimizer 和 is_best)
+        save_checkpoint(cfg, text_encoder, state_net, optimizer, epoch, loss, is_best)
 
     writer.close()
 
