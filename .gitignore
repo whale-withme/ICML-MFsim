@@ -1,2 +1,4 @@
 **/__pycache__
 checkpoints/*.pt
+checkpoints/*
+checkpoints_policy/

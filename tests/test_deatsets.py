@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 
 sys.path.append(os.getcwd())
 
-from training.datasets import StateTransitionDataset
+from datasets.state_datasets import StateTransitionDataset
 
 
 def test_dataset_basic():

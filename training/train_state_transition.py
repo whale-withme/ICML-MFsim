@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer  # 如果用 BERT
+from transformers import AutoTokenizer 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -22,7 +22,7 @@ if ROOT_DIR not in sys.path:
 # 假设 encoders 和 dataset 都在正确位置
 from model.state_transition.encoders import build_text_encoder
 from model.state_transition.state_transition_net import StateTransitionNet
-from datasets import StateTransitionDataset  # 引用你修改后的 Dataset
+from datasets.state_datasets import StateTransitionDataset 
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -48,6 +48,10 @@ class TrainConfig:
     hidden_dim: int = 256
     use_layernorm: bool = True
     
+    # [新增] Loss 权重平衡系数
+    # alpha * Batch_Loss + (1-alpha) * Global_Loss
+    alpha: float = 1 
+    
     train_batch_size: int = 32
     max_event: int = 100
     num_agents: int = 16 
@@ -57,8 +61,8 @@ class TrainConfig:
     grad_clip: float = 1.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     log_interval: int = 10
-    save_dir: str = os.path.join(ROOT_DIR, "checkpoints")
-    save_name: str = "state_transition_best.pt"
+    save_dir: str = os.path.join(ROOT_DIR, "checkpoints/only_batch") # 在这里改保存的MLP地址
+    save_name: str = "state_transition_best_batch.pt"
 
 import glob
 from torch.utils.data import ConcatDataset
@@ -69,9 +73,9 @@ def build_dataloader(cfg: TrainConfig, tokenizer) -> DataLoader:
     
     loader = DataLoader(
         full_dataset,
-        batch_size=cfg.train_batch_size, # 这里是 32
+        batch_size=cfg.train_batch_size,
         shuffle=True, # 这一步很关键！它会打乱不同事件里的样本
-        num_workers=4, # 此时可以开启多进程加速读取
+        num_workers=10, # 此时可以开启多进程加速读取
         pin_memory=True
     )
     
@@ -88,7 +92,6 @@ def build_full_dataset(cfg: TrainConfig):
     """
     
     # 1. 以 Trajectory (状态分布 GT) 文件为锚点进行扫描
-    # 注意：这里扫描的是 state_trajectory_dir
     traj_pattern = os.path.join(cfg.state_trajectory_dir, "*_trajectory.csv")
     traj_files = glob.glob(traj_pattern)
     
@@ -119,11 +122,10 @@ def build_full_dataset(cfg: TrainConfig):
     print(f"   (共发现 {len(traj_files)} 个分布文件)")
 
     for traj_path in traj_files:
-        # traj_path = ".../4264473811_trajectory.csv"
-        filename = os.path.basename(traj_path)  # "4264473811_trajectory.csv"
+        filename = os.path.basename(traj_path)
         
         # 2. 提取 ID (去除后缀 _trajectory.csv)
-        event_id = filename.replace("_trajectory.csv", "") # "4264473811"
+        event_id = filename.replace("_trajectory.csv", "")
         
         # 排除非数据文件
         if "cluster" in event_id or "profile" in event_id:
@@ -145,7 +147,7 @@ def build_full_dataset(cfg: TrainConfig):
         # 5. 实例化单个 Dataset
         try:
             ds = StateTransitionDataset(
-                trajectory_path=traj_path,  # 锚点文件
+                trajectory_path=traj_path,
                 mf_path=mf_path,
                 test_data_path=json_path,
                 profile_path=cfg.profile_path,
@@ -168,12 +170,12 @@ def build_full_dataset(cfg: TrainConfig):
 
 
 def build_models(cfg: TrainConfig):
-    # 1. 文本编码器 (用于处理环境文本 mf_text)
+    # 1. 文本编码器
     encoder_config = {
         "type": cfg.encoder_type,
         "model_name": cfg.model_name,
         "output_dim": cfg.text_emb_dim,
-        "freeze": False # 训练时是否微调 BERT
+        "freeze": False
     }
     text_encoder = build_text_encoder(encoder_config)
 
@@ -200,12 +202,21 @@ def train_one_epoch(
     state_net.train()
     
     total_loss = 0.0
+    total_loss_batch = 0.0
+    total_loss_global = 0.0
     total_steps = 0
 
     for batch_idx, batch_data in enumerate(train_loader):
         # 1. 解包数据并送入设备
-        mu_prev = batch_data["mu_prev"].to(cfg.device)        # (B, 3)
-        target_dist = batch_data["target_dist"].to(cfg.device) # (B, 3)
+        mu_prev = batch_data["mu_prev"].to(cfg.device)        # (B, 3) 上一时刻分布
+        target_dist_batch = batch_data["target_dist_batch"].to(cfg.device) # (B, 3) 当前Batch真实分布
+        
+        # [修改] 使用 Reference 代码中的命名，如果您的 Dataset key 是 target_dist_sum，请保持对应
+        cum_target = batch_data.get("target_dist_sum").to(cfg.device) # (B, 3) 真实全局分布
+        
+        # [关键] 需要 Dataset 返回当前样本是第几步 (step_idx)，用于计算 Global Loss
+        step_idx = batch_data["step_idx"].to(cfg.device) # (B,)
+        
         agent_feats = batch_data["profile_vecs"].to(cfg.device) # (B, N, D_u)
         mf_texts = batch_data["mf_text"] # List[str]
         
@@ -226,31 +237,29 @@ def train_one_epoch(
              text_emb = text_encoder(tokenized_inputs['input_ids'])
 
         # 3. 状态转移网络前向传播
+        # mu_pred: 当前 Batch 的微观预测
         mu_pred, _ = state_net(mu_prev, text_emb, agent_feats)
 
-        # 4. 计算 Loss (KL Divergence)
+        # 4. 计算混合 Loss
+        # A. Batch Loss: 微观层面拟合
         log_mu_pred = torch.log(mu_pred + 1e-8)
-        loss = F.kl_div(log_mu_pred, target_dist, reduction='batchmean')
+        loss_batch = F.kl_div(log_mu_pred, target_dist_batch, reduction='batchmean')
 
-        # ==========================================================
-        # [新增] 计算辅助指标 (不参与梯度回传，使用 no_grad)
-        # ==========================================================
-        with torch.no_grad():
-            # A. MAE (平均绝对误差): 直观理解概率偏离了多少
-            mae = F.l1_loss(mu_pred, target_dist).item()
+        # B. Global Loss: 宏观层面拟合 (Reference 逻辑)
+        # 公式: pred_global = (step * prev_global_gt + batch_pred) / (step + 1)
+        # 解释: 假设上一时刻的累计分布 mu_prev 是准确的(Ground Truth)，我们看加上当前的 mu_pred 后，是否符合新的累计分布
+        t = step_idx.unsqueeze(1).float() # (B, 1)
+        pred_global = (t * mu_prev + mu_pred) / (t + 1.0)
+        loss_global = F.kl_div(torch.log(pred_global + 1e-8), cum_target, reduction='batchmean')
 
-            # B. Trend Accuracy (趋势准确率): 预测的主要方向(Pos/Neu/Neg)是否对齐
-            pred_label = torch.argmax(mu_pred, dim=1)
-            target_label = torch.argmax(target_dist, dim=1)
-            acc = (pred_label == target_label).float().mean().item()
+        # C. 最终加权 Loss
+        loss = cfg.alpha * loss_batch + (1.0 - cfg.alpha) * loss_global
 
         # 5. 反向传播
         optimizer.zero_grad()
         loss.backward()
 
-        # ==========================================================
-        # [新增] 计算梯度范数 (用于监控梯度爆炸/消失)
-        # ==========================================================
+        # 计算梯度范数
         grad_norm = 0.0
         for p in list(text_encoder.parameters()) + list(state_net.parameters()):
             if p.grad is not None:
@@ -266,30 +275,51 @@ def train_one_epoch(
         optimizer.step()
 
         # ==========================================================
-        # [新增] 写入 TensorBoard 多条曲线
+        # 计算辅助指标
+        # ==========================================================
+        with torch.no_grad():
+            # 微观指标
+            mae_batch = F.l1_loss(mu_pred, target_dist_batch).item()
+            pred_label = torch.argmax(mu_pred, dim=1)
+            target_label = torch.argmax(target_dist_batch, dim=1)
+            acc_batch = (pred_label == target_label).float().mean().item()
+            
+            # 宏观指标 [新增]
+            mae_global = F.l1_loss(pred_global, cum_target).item()
+            global_pred_label = torch.argmax(pred_global, dim=1)
+            global_target_label = torch.argmax(cum_target, dim=1)
+            acc_global = (global_pred_label == global_target_label).float().mean().item()
+
+        # ==========================================================
+        # 写入 TensorBoard (详细曲线)
         # ==========================================================
         global_step = (epoch - 1) * len(train_loader) + batch_idx
         
-        # 1. 训练损失 (最重要)
-        writer.add_scalar('Loss/train_kl', loss.item(), global_step)
+        # Loss 曲线
+        writer.add_scalar('Loss/total', loss.item(), global_step)
+        writer.add_scalar('Loss/batch_component', loss_batch.item(), global_step)
+        writer.add_scalar('Loss/global_component', loss_global.item(), global_step)
         
-        # 2. 业务指标 (给人看)
-        writer.add_scalar('Metric/MAE', mae, global_step)
-        writer.add_scalar('Metric/Accuracy', acc, global_step)
+        # 性能指标
+        writer.add_scalar('Metric/MAE_Batch', mae_batch, global_step)
+        writer.add_scalar('Metric/MAE_Global', mae_global, global_step)
+        writer.add_scalar('Metric/Acc_Batch', acc_batch, global_step)
+        writer.add_scalar('Metric/Acc_Global', acc_global, global_step)
         
-        # 3. 调试指标 (给开发者看)
+        # 调试信息
         writer.add_scalar('Debug/Grad_Norm', grad_norm, global_step)
-        # 监控学习率变化 (如果是动态学习率的话很有用)
-        current_lr = optimizer.param_groups[0]['lr']
-        writer.add_scalar('Debug/LR', current_lr, global_step)
+        writer.add_scalar('Debug/LR', optimizer.param_groups[0]['lr'], global_step)
 
         total_loss += loss.item()
+        total_loss_batch += loss_batch.item()
+        total_loss_global += loss_global.item()
         total_steps += 1
 
         if (batch_idx + 1) % cfg.log_interval == 0:
             logger.info(
-                f"[Epoch {epoch}] Step {batch_idx+1}/{len(train_loader)} "
-                f"Loss: {loss.item():.6f} | MAE: {mae:.4f} | Acc: {acc:.2%} | Grad: {grad_norm:.2f}"
+                f"[Epoch {epoch}] Step {batch_idx+1}/{len(train_loader)} | "
+                f"L_tot: {loss.item():.4f} (B:{loss_batch.item():.4f}, G:{loss_global.item():.4f}) | "
+                f"MAE: {mae_batch:.3f} | Acc: {acc_batch:.1%}"
             )
 
     avg_loss = total_loss / max(1, total_steps)
@@ -304,12 +334,12 @@ def save_checkpoint(cfg, text_encoder, state_net, optimizer, epoch, loss, is_bes
         'epoch': epoch,
         'model_state_dict': state_net.state_dict(),
         'encoder_state_dict': text_encoder.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(), # [关键] 保存优化器状态
+        'optimizer_state_dict': optimizer.state_dict(), # 依然保存优化器状态
         'loss': loss,
         'config': str(cfg)
     }
 
-    last_path = os.path.join(cfg.save_dir, "checkpoint_last.pt")
+    last_path = os.path.join(cfg.save_dir, "checkpoint_last_batch.pt")
     torch.save(ckpt, last_path)
 
     if is_best:
@@ -330,8 +360,10 @@ def main():
     cfg = TrainConfig()
     cfg.num_epochs = args.epochs
     cfg.train_batch_size = args.batch_size
+    # 您可以在这里覆盖 cfg.alpha，例如 cfg.alpha = 0.6
 
-    log_dir = f"checkpoints/runs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    beijing_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    log_dir = f"checkpoints/runs/run_{beijing_now.strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir)
     
     logger.info(f"Device: {cfg.device}")
@@ -342,7 +374,6 @@ def main():
     state_net.to(cfg.device)
     
     # 2. 构建 DataLoader
-    # 确保传入正确的函数调用
     train_loader = build_dataloader(cfg, getattr(text_encoder, 'tokenizer', None))
 
     # 3. 优化器
@@ -366,21 +397,18 @@ def main():
             state_net.load_state_dict(checkpoint['model_state_dict'])
             text_encoder.load_state_dict(checkpoint['encoder_state_dict'])
             
-            # 恢复优化器 (这就保证了学习率和动量是接着上次的)
+            # 恢复优化器
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             
-            # 恢复 Epoch (从下一轮开始)
+            # 恢复 Epoch
             start_epoch = checkpoint['epoch'] + 1
-            best_loss = checkpoint.get('loss', float('inf')) # 尝试获取上次的 loss
+            best_loss = checkpoint.get('loss', float('inf'))
             
             print(f"✅ 恢复成功！将从 Epoch {start_epoch} 开始继续训练。")
         else:
             print(f"⚠️ 未找到 {ckpt_path}，将从头开始训练。")
 
-    # 4. 训练循环
-    #range 从 start_epoch 开始
     for epoch in range(start_epoch, cfg.num_epochs + 1):
-        # 记得把 writer 传进去
         loss = train_one_epoch(epoch, cfg, text_encoder, state_net, optimizer, train_loader, writer)
         
         # 判断是否是最佳
@@ -388,7 +416,6 @@ def main():
         if is_best:
             best_loss = loss
             
-        # 保存 (注意参数变了，传入了 optimizer 和 is_best)
         save_checkpoint(cfg, text_encoder, state_net, optimizer, epoch, loss, is_best)
 
     writer.close()

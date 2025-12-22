@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from model.state_transition.encoders import build_text_encoder
 from model.state_transition.state_transition_net import StateTransitionNet
 # 引入上面的 dataset
-from datasets import TrajectoryDistDataset, trajectory_dist_collate
+from datasets.state_datasets import TrajectoryDistDataset, trajectory_dist_collate
 
 def train_distribution_matching():
     # === 配置 ===
