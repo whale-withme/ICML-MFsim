@@ -4,6 +4,7 @@ import torch
 import json
 import pandas as pd
 import argparse
+from torch.utils.data import random_split
 from transformers import (
     AutoTokenizer, 
     TrainingArguments, 
@@ -16,7 +17,7 @@ if ROOT_DIR not in sys.path:
 
 # --- 导入你提供的自定义模块 ---
 # 确保这三个文件在同一目录下，或者在PYTHONPATH中
-from model.policyLLM.predict_trainer import PolicyTrainer
+from model.policyLLM.predict_trainer import PolicyTrainer, SaveMLPCallback
 from model.policyLLM.lora_base_model import PolicyMLPModel
 from datasets.policy_datasets import PolicyModelDataset
 
@@ -151,183 +152,88 @@ def _generate_mock_data():
 
     
 def main():
-    import os
-    import datetime
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="/root/qwen2-1.5B", help="HuggingFace model ID or local path")
-    parser.add_argument("--data_path", type=str, default="/root/ICML/data/pre_policy", help="Path to training data json")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_policy/", help="Output directory")
+    parser.add_argument("--model_name", type=str, default="/root/qwen2-1.5B")
+    parser.add_argument("--data_path", type=str, default="/root/ICML/data/pre_policy")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_policy/")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lambda_coeff", type=float, default=1.0, help="Weight for trajectory prediction loss")
-    parser.add_argument("--k_steps", type=int, default=10, help="Number of future steps to predict")
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
+    parser.add_argument("--lambda_coeff", type=float, default=0.4)
+    parser.add_argument("--k_steps", type=int, default=10)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    # 生成带时间戳的tensorboard目录
-    beijing_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    log_dir = os.path.join(args.output_dir, "runs", f"run_{beijing_now.strftime('%Y%m%d_%H%M%S')}")
-    from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(log_dir)
-
     # 1. 初始化 Tokenizer
-    print(f"[INFO] Loading Tokenizer from {args.model_name}...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-        print("[INFO] Tokenizer loaded successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to load tokenizer: {e}")
-        raise
-    # Qwen 的 pad token 设置
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        print("[INFO] Set pad_token to eos_token")
 
-    # 2. 准备数据
-    print(f"[INFO] Loading raw data from {args.data_path} ...")
-    raw_data = load_raw_data(args.data_path)
-    print(f"[INFO] Raw data loaded. Total records: {len(raw_data)}")
+    # 2. 准备数据并划分验证集
+    raw_data = load_raw_data(args.data_path) # 假设该函数已定义
+    full_dataset = PolicyModelDataset(raw_data, tokenizer, max_length=1024, k_steps=args.k_steps)
     
-    # 实例化 Dataset
-    # 注意：max_length 包含了 prompt + response，如果你的 prompt 很长，请适当调大
-    print("[INFO] Initializing PolicyModelDataset ...")
-    train_dataset = PolicyModelDataset(
-        data=raw_data, 
-        tokenizer=tokenizer, 
-        max_length=1024, 
-        k_steps=args.k_steps
-    )
-    print(f"[INFO] Dataset loaded. Total samples: {len(train_dataset)}")
-    # 打印一条样本检查格式
-    try:
-        sample_item = train_dataset[0]
-        print(f"[INFO] Sample input_ids shape: {getattr(sample_item['input_ids'], 'shape', type(sample_item['input_ids']))}")
-        print(f"[INFO] Sample current_state shape: {getattr(sample_item['current_state'], 'shape', type(sample_item['current_state']))}")
-        print(f"[INFO] Sample future_states shape: {getattr(sample_item['future_states'], 'shape', type(sample_item['future_states']))}")
-    except Exception as e:
-        print(f"[WARN] Could not print sample item shapes: {e}")
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    # 3. 初始化模型 (Base + LoRA + MLP)
-    print("[INFO] Initializing Model...")
-    try:
-        model = PolicyMLPModel(
-            base_model_name=args.model_name,
-            k_steps=args.k_steps,
-            state_dim=3, # 假设是 [Pos, Neg, Neu] 三分类
-            lora_rank=args.lora_rank
-        )
-        print("[INFO] Model initialized.")
-    except Exception as e:
-        print(f"[ERROR] Failed to initialize model: {e}")
-        raise
-    # 打印可训练参数量
-    try:
-        model.llm.print_trainable_parameters()
-    except Exception as e:
-        print(f"[WARN] Could not print trainable parameters: {e}")
+    # 3. 初始化模型
+    model = PolicyMLPModel(args.model_name, k_steps=args.k_steps, lora_rank=16)
 
-    # ========== 断点续训 ===========
-    import glob
-    import torch
-    import os
-    start_epoch = 1
-    best_loss = float('inf')
-    last_ckpt_path = os.path.join(args.output_dir, "checkpoint_last.pt")
-    best_ckpt_path = os.path.join(args.output_dir, "policy_best.pt")
-    if args.resume and os.path.exists(last_ckpt_path):
-        print(f"[INFO] Loading checkpoint from {last_ckpt_path} ...")
-        checkpoint = torch.load(last_ckpt_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint.get('epoch', 1)
-        best_loss = checkpoint.get('best_loss', float('inf'))
-        print(f"[INFO] Resume from epoch {start_epoch}, best_loss={best_loss}")
+    # --- 断点续训逻辑：手动恢复 MLP 头 ---
+    if args.resume:
+        checkpoints = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")), 
+                             key=lambda x: int(x.split('-')[-1]))
+        if checkpoints:
+            last_ckpt = checkpoints[-1]
+            mlp_path = os.path.join(last_ckpt, "prediction_heads.pt")
+            if os.path.exists(mlp_path):
+                print(f"[INFO] Resuming MLP heads from {mlp_path}")
+                model.prediction_heads.load_state_dict(torch.load(mlp_path, map_location='cpu'))
 
-    # 4. 配置训练参数
-    print("[INFO] Setting up TrainingArguments ...")
+    # 4. 配置训练参数 (每100步保存/评估，保留最优)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
+        gradient_accumulation_steps=4,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
         logging_steps=10,
-        save_strategy="epoch",
-        report_to="tensorboard",
-        logging_dir=log_dir,
-        bf16=True, # 强烈建议开启 BF16，如果显卡不支持请改为 fp16=True
-        # --- 关键参数 ---
-        # 必须设为 False！
-        # 否则 Trainer 会自动删除 input_ids/labels 以外的自定义列 (如 current_state, future_states)
-        # 导致模型 forward 报错
+        
+        save_strategy="steps",
+        save_steps=100,
+        eval_strategy="steps", 
+        eval_steps=100,
+        # --------------------------------------------------------
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="loss",
+        
+        bf16=True,
         remove_unused_columns=False,
-        dataloader_num_workers=10,
-        # 梯度裁剪，防止 MLP 训练初期梯度爆炸
-        max_grad_norm=1.0, 
+        report_to="tensorboard",
     )
-    print("[INFO] TrainingArguments set.")
 
-    # 5. 初始化自定义 Trainer
-    print("[INFO] Initializing PolicyTrainer ...")
-    # 使用 DataCollatorForSeq2Seq 确保 padding 正确 (虽然 Dataset 里做了 padding，但用 collator 更稳健)
-    data_collator = DataCollatorForSeq2Seq(tokenizer, padding=True)
-
+    # 5. 初始化 Trainer
     trainer = PolicyTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=data_collator,
-        lambda_coeff=args.lambda_coeff # 传递 Loss 权重系数
+        eval_dataset=val_dataset,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True),
+        lambda_coeff=args.lambda_coeff,
+        callbacks=[SaveMLPCallback()] # 注入回调以保存 MLP
     )
-    print("[INFO] PolicyTrainer initialized.")
 
     # 6. 开始训练
     print("[INFO] Starting training...")
-    best_metric = best_loss
-    for epoch in range(start_epoch, args.epochs + 1):
-        try:
-            # 训练一个epoch
-            train_result = trainer.train(resume_from_checkpoint=last_ckpt_path if (args.resume and epoch == start_epoch and os.path.exists(last_ckpt_path)) else None)
-            # 获取loss
-            metrics = train_result.metrics if hasattr(train_result, 'metrics') else {}
-            epoch_loss = metrics.get('train_loss', None)
-            print(f"[INFO] Epoch {epoch} finished. train_loss={epoch_loss}")
-        except Exception as e:
-            print(f"[ERROR] Training failed at epoch {epoch}: {e}")
-            raise
+    # 如果开启了 resume，Trainer 会自动寻找最新的 checkpoint-XXX
+    trainer.train(resume_from_checkpoint=args.resume)
 
-        # 保存最后权重
-        print(f"[INFO] Saving last checkpoint to {last_ckpt_path}")
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'best_loss': best_metric
-        }, last_ckpt_path)
-
-        # 保存最优权重
-        if epoch_loss is not None and (epoch_loss < best_metric):
-            best_metric = epoch_loss
-            print(f"[INFO] Saving best checkpoint to {best_ckpt_path} (loss={best_metric})")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'best_loss': best_metric
-            }, best_ckpt_path)
-
-    # 7. 保存最终模型
-    print(f"[INFO] Saving model to {args.output_dir} ...")
-    try:
-        # 调用 PolicyMLPModel 中自定义的 save_pretrained
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        print("[INFO] Model and tokenizer saved.")
-    except Exception as e:
-        print(f"[ERROR] Failed to save model or tokenizer: {e}")
-        raise
-    writer.close()
-    print("[INFO] Done!")
+    # 7. 最终保存 (保存的是 load_best_model_at_end 加载后的最优版本)
+    model.save_pretrained(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print("[INFO] Training and saving finished.")
 
 if __name__ == "__main__":
     main()
